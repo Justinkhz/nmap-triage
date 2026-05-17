@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nmap_triage — Elite Nmap Vulnerability Triage Tool
+nmap_triage — Nmap Vulnerability Triage Tool
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Recommended scan command:
   nmap -p- -sV -sC --script vuln,vulners -oX scan.xml <target>
