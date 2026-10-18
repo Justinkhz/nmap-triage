@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nmap_triage — Nmap Vulnerability Triage Tool
+nmap_triage — Elite Nmap Vulnerability Triage Tool
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Recommended scan command:
   nmap -p- -sV -sC --script vuln,vulners -oX scan.xml <target>
@@ -12,6 +12,7 @@ Usage:
   python nmap_triage.py scan.xml --only-high
   python nmap_triage.py scan.xml --min-cvss 7.0
   python nmap_triage.py scan.xml --only-exploitable
+  python nmap_triage.py scan1.xml --merge scan2.xml
 """
 
 import argparse
@@ -279,6 +280,33 @@ ATTACK_COMBOS = [
     },
 ]
 
+# Misconfiguration signatures — detected from specific NSE script output.
+# match="" means: the script firing at all (with any output) is itself the finding.
+MISCONFIG_PATTERNS = [
+    {"script_id": "ftp-anon",             "match": "anonymous ftp login allowed", "severity": "CRITICAL",
+     "label": "Anonymous FTP login allowed"},
+    {"script_id": "smb-security-mode",    "match": "message_signing: disabled",   "severity": "HIGH",
+     "label": "SMB signing disabled — vulnerable to relay attacks"},
+    {"script_id": "mysql-empty-password", "match": "",                            "severity": "CRITICAL",
+     "label": "MySQL account with empty password"},
+    {"script_id": "ms-sql-empty-password","match": "",                            "severity": "CRITICAL",
+     "label": "MSSQL account with empty password"},
+    {"script_id": "mongodb-databases",    "match": "",                            "severity": "HIGH",
+     "label": "MongoDB accessible without authentication"},
+    {"script_id": "mongodb-info",         "match": "no auth required",            "severity": "HIGH",
+     "label": "MongoDB accessible without authentication"},
+    {"script_id": "redis-info",           "match": "authenticated: no",           "severity": "HIGH",
+     "label": "Redis accessible without authentication"},
+    {"script_id": "vnc-info",             "match": "",                            "severity": "HIGH",
+     "label": "VNC server exposed — verify authentication is required"},
+    {"script_id": "smtp-open-relay",      "match": "server is an open relay",     "severity": "HIGH",
+     "label": "SMTP open relay"},
+    {"script_id": "http-default-accounts","match": "credentials found",           "severity": "HIGH",
+     "label": "Default web application credentials accepted"},
+    {"script_id": "docker-version",       "match": "auth: none",                  "severity": "CRITICAL",
+     "label": "Docker API exposed with no authentication"},
+]
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -309,8 +337,9 @@ class PortInfo:
     version: str
     extra_info: str
     conf: int = 0              # Nmap service detection confidence (0-10)
-    scripts: list = field(default_factory=list)   # list[ScriptFinding]
+    scripts: list = field(default_factory=list)    # list[ScriptFinding]
     cves: list = field(default_factory=list)       # list[CVEFinding]
+    misconfigs: list = field(default_factory=list) # list[dict: label, severity, detail]
     risk_level: str = "UNKNOWN"
     risk_reason: str = ""
     max_cvss: float = 0.0
@@ -350,6 +379,7 @@ class HostInfo:
     risk_level: str = "LOW"
     cve_count: int = 0
     exploitable_count: int = 0
+    misconfig_count: int = 0
 
     @property
     def display_name(self) -> str:
@@ -437,6 +467,7 @@ def parse_nmap_xml(filepath: str) -> list:
                             p.has_exploit = True
 
             assess_port_risk(p)
+            detect_misconfigs(p)
             host.ports.append(p)
 
         # Host-level scripts (e.g. smb-vuln-* run at host level in some scans)
@@ -447,6 +478,7 @@ def parse_nmap_xml(filepath: str) -> list:
                     if port.port in (445, 139) and port.open:
                         port.scripts.append(sf)
                         port.cves.extend(sf.cves)
+                        detect_misconfigs(port)
 
         detect_attack_paths(host)
         score_host(host)
@@ -578,6 +610,29 @@ def assess_port_risk(p: PortInfo):
         p.risk_reason = "Unknown service — manual investigation needed"
 
 
+def detect_misconfigs(p: PortInfo):
+    """Flag known misconfigurations from specific NSE script output.
+    Distinct from CVE findings: a misconfig is a setting, not a software bug."""
+    for sf in p.scripts:
+        out_lower = sf.output.lower()
+        for mc in MISCONFIG_PATTERNS:
+            if sf.script_id != mc["script_id"]:
+                continue
+            if mc["match"] != "" and mc["match"] not in out_lower:
+                continue
+            # Avoid duplicate entries if parsed twice
+            if any(m["label"] == mc["label"] for m in p.misconfigs):
+                continue
+            p.misconfigs.append({
+                "label": mc["label"],
+                "severity": mc["severity"],
+                "detail": sf.output[:200],
+            })
+            if RISK_ORDER[mc["severity"]] > RISK_ORDER.get(p.risk_level, 0):
+                p.risk_level  = mc["severity"]
+                p.risk_reason = f"Misconfig: {mc['label']}"
+
+
 def detect_attack_paths(host: HostInfo):
     open_set = host.open_port_numbers
     for combo in ATTACK_COMBOS:
@@ -602,6 +657,8 @@ def score_host(host: HostInfo):
             score += w * w * 1.5
         if p.has_exploit:
             score += 10
+        for m in p.misconfigs:
+            score += RISK_ORDER.get(m["severity"], 0) * 3
         if RISK_ORDER.get(p.risk_level, 0) > RISK_ORDER.get(highest, 0):
             highest = p.risk_level
 
@@ -612,10 +669,11 @@ def score_host(host: HostInfo):
         if RISK_ORDER.get(ap.risk, 0) > RISK_ORDER.get(highest, 0):
             highest = ap.risk
 
-    host.risk_score      = round(score, 1)
-    host.risk_level      = highest
-    host.cve_count       = sum(len(p.cves) for p in host.open_ports)
+    host.risk_score        = round(score, 1)
+    host.risk_level        = highest
+    host.cve_count         = sum(len(p.cves) for p in host.open_ports)
     host.exploitable_count = sum(1 for p in host.open_ports if p.has_exploit)
+    host.misconfig_count   = sum(len(p.misconfigs) for p in host.open_ports)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -675,6 +733,51 @@ def correlate_hosts(hosts: list) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SCAN MERGING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def merge_hosts(primary: list, secondary: list) -> list:
+    """Combine two scans of the same network — e.g. a fast -sS discovery pass
+    and a later -p- -sV -sC deep pass. Hosts are matched by IP; a host only
+    in the secondary scan is added whole. For a host in both, ports are
+    unioned by (port, protocol); when both scans saw the same port, the
+    entry with more evidence (scripts, CVEs, a detected version) wins."""
+    by_ip = {h.ip: h for h in primary}
+
+    for hb in secondary:
+        if hb.ip not in by_ip:
+            by_ip[hb.ip] = hb
+            continue
+
+        ha = by_ip[hb.ip]
+        if not ha.hostname and hb.hostname:
+            ha.hostname = hb.hostname
+        if not ha.os_guess and hb.os_guess:
+            ha.os_guess = hb.os_guess
+            ha.os_confidence = hb.os_confidence
+
+        existing = {(p.port, p.protocol): i for i, p in enumerate(ha.ports)}
+        for pb in hb.ports:
+            key = (pb.port, pb.protocol)
+            if key not in existing:
+                ha.ports.append(pb)
+                existing[key] = len(ha.ports) - 1
+                continue
+            pa = ha.ports[existing[key]]
+            a_richness = len(pa.cves) + len(pa.scripts) + (1 if pa.version else 0)
+            b_richness = len(pb.cves) + len(pb.scripts) + (1 if pb.version else 0)
+            if b_richness > a_richness or pb.max_cvss > pa.max_cvss:
+                ha.ports[existing[key]] = pb
+
+    merged = list(by_ip.values())
+    for h in merged:
+        h.attack_paths = []
+        detect_attack_paths(h)
+        score_host(h)
+    return merged
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TERMINAL OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -703,6 +806,7 @@ def print_summary(hosts: list, top_n: int, show_all_ports: bool = False):
     counts = {lvl: sum(1 for h in hosts if h.risk_level == lvl) for lvl in RISK_ORDER}
     total_cves = sum(h.cve_count for h in hosts)
     total_exploitable = sum(h.exploitable_count for h in hosts)
+    total_misconfigs = sum(h.misconfig_count for h in hosts)
 
     W = 76
     print(f"\n{BOLD}{'═'*W}{RESET}")
@@ -713,7 +817,9 @@ def print_summary(hosts: list, top_n: int, show_all_ports: bool = False):
           f"{c('■ HIGH: '+str(counts['HIGH']),'HIGH')}   "
           f"{c('■ MEDIUM: '+str(counts['MEDIUM']),'MEDIUM')}   "
           f"{c('■ LOW: '+str(counts['LOW']),'LOW')}")
-    print(f"  CVEs found: {BOLD}{total_cves}{RESET}   Exploitable: {c(str(total_exploitable),'CRITICAL') if total_exploitable else '0'}")
+    print(f"  CVEs found: {BOLD}{total_cves}{RESET}   "
+          f"Exploitable: {c(str(total_exploitable),'CRITICAL') if total_exploitable else '0'}   "
+          f"Misconfigs: {c(str(total_misconfigs),'HIGH') if total_misconfigs else '0'}")
     print(f"\n  Showing top {len(show)} hosts  (sorted by risk score)\n{'─'*W}\n")
 
     for rank, host in enumerate(show, 1):
@@ -721,9 +827,10 @@ def print_summary(hosts: list, top_n: int, show_all_ports: bool = False):
         score_str = f"score={host.risk_score}"
         cve_str   = f"  {c(str(host.cve_count)+' CVEs','HIGH')}" if host.cve_count else ""
         expl_str  = f"  {c('⚡ '+str(host.exploitable_count)+' exploitable','CRITICAL')}" if host.exploitable_count else ""
+        misc_str  = f"  {c('⚠ '+str(host.misconfig_count)+' misconfig','HIGH')}" if host.misconfig_count else ""
 
         print(f"  {BOLD}#{rank:02d}  {host.display_name}{RESET}")
-        print(f"       {tag}  {DIM}{score_str}{RESET}{cve_str}{expl_str}")
+        print(f"       {tag}  {DIM}{score_str}{RESET}{cve_str}{expl_str}{misc_str}")
         if host.os_guess:
             conf = f" ({host.os_confidence}%)" if host.os_confidence else ""
             print(f"       {DIM}OS: {host.os_guess}{conf}{RESET}")
@@ -745,6 +852,10 @@ def print_summary(hosts: list, top_n: int, show_all_ports: bool = False):
 
             print(f"       {tag_p}  {port_s:<14}  {svc_s}{conf_s}{cvss_s}{expl_s}")
             print(f"                  {DIM}↳ {p.risk_reason}{RESET}")
+
+            # Misconfigurations — shown distinctly from CVEs
+            for m in p.misconfigs:
+                print(f"                  {c('⚠ MISCONFIG','HIGH')} [{m['severity']}]: {m['label']}")
 
             # Show notable script findings (non-vulners, interesting scripts)
             for sf in p.scripts:
@@ -802,6 +913,7 @@ def export_json(hosts: list, correlations: list, output_path: str):
             "os_confidence": h.os_confidence, "mac": h.mac,
             "risk_level": h.risk_level, "risk_score": h.risk_score,
             "cve_count": h.cve_count, "exploitable_count": h.exploitable_count,
+            "misconfig_count": h.misconfig_count,
             "open_port_count": len(h.open_ports),
             "ports": [port_to_dict(p) for p in h.open_ports],
             "attack_paths": [
@@ -818,6 +930,7 @@ def export_json(hosts: list, correlations: list, output_path: str):
             "max_cvss": p.max_cvss, "has_exploit": p.has_exploit,
             "version_confidence": p.version_confidence,
             "cves": [{"id": c.cve_id, "cvss": c.cvss, "exploitable": c.exploitable} for c in p.cves],
+            "misconfigs": p.misconfigs,
             "scripts": [{"id": s.script_id, "risk": s.risk_level, "output": s.output[:200]} for s in p.scripts],
         }
 
@@ -831,6 +944,7 @@ def export_json(hosts: list, correlations: list, output_path: str):
             "low":      sum(1 for h in hosts if h.risk_level in ("LOW","INFO")),
             "total_cves": sum(h.cve_count for h in hosts),
             "exploitable_findings": sum(h.exploitable_count for h in hosts),
+            "total_misconfigs": sum(h.misconfig_count for h in hosts),
         },
         "hosts": [host_to_dict(h) for h in sorted(hosts, key=lambda h: h.risk_score, reverse=True)],
         "correlations": correlations,
@@ -858,6 +972,7 @@ def generate_html(hosts: list, correlations: list, output_path: str, top_n: int)
     counts = {lvl: sum(1 for h in hosts if h.risk_level == lvl) for lvl in RISK_ORDER}
     total_cves = sum(h.cve_count for h in hosts)
     total_exploitable = sum(h.exploitable_count for h in hosts)
+    total_misconfigs = sum(h.misconfig_count for h in hosts)
 
     def badge(level, text=None):
         col = RISK_CSS.get(level, "#666")
@@ -872,6 +987,17 @@ def generate_html(hosts: list, correlations: list, output_path: str, top_n: int)
 
     host_cards = ""
     for rank, host in enumerate(sorted_hosts, 1):
+        # Misconfig summary chips for this host
+        misc_html = ""
+        all_misconfigs = [(p, m) for p in host.open_ports for m in p.misconfigs]
+        if all_misconfigs:
+            chips = "".join(
+                f'<div class="misconfig-row"><span class="badge" style="background:{RISK_CSS.get(m["severity"],"#666")};color:#fff">{m["severity"]}</span> '
+                f'<strong>{m["label"]}</strong> <span class="reason">(port {p.port})</span></div>'
+                for p, m in all_misconfigs
+            )
+            misc_html = f'<div class="misconfig-section"><div class="ap-title">⚠ Misconfigurations</div>{chips}</div>'
+
         # Ports table
         port_rows = ""
         for p in sorted(host.open_ports, key=lambda x: (RISK_ORDER.get(x.risk_level,0), x.max_cvss), reverse=True):
@@ -912,19 +1038,21 @@ def generate_html(hosts: list, correlations: list, output_path: str, top_n: int)
 
         cve_badge  = f'<span class="stat-pill">{host.cve_count} CVEs</span>' if host.cve_count else ""
         expl_badge = f'<span class="stat-pill expl">⚡ {host.exploitable_count} exploitable</span>' if host.exploitable_count else ""
+        misc_badge = f'<span class="stat-pill misc">⚠ {host.misconfig_count} misconfig</span>' if host.misconfig_count else ""
         os_html    = f'<div class="os-row">OS: {host.os_guess}{(" ("+str(host.os_confidence)+"%)" if host.os_confidence else "")}</div>' if host.os_guess else ""
 
         host_cards += f"""
-      <div class="host-card">
+      <div class="host-card" data-searchtext="{host.ip} {host.hostname} {' '.join(str(p.port)+' '+p.full_service_str for p in host.open_ports)}">
         <div class="host-header" style="border-left:4px solid {RISK_CSS.get(host.risk_level,'#666')}">
           <span class="rank">#{rank:02d}</span>
           <span class="host-ip">{host.display_name}</span>
           {badge(host.risk_level)}
           <span class="score">score {host.risk_score}</span>
           <span class="port-count">{len(host.open_ports)} ports</span>
-          {cve_badge}{expl_badge}
+          {cve_badge}{expl_badge}{misc_badge}
         </div>
         {os_html}
+        {misc_html}
         <table class="port-table">
           <thead><tr><th>Risk</th><th>Port</th><th>Service</th><th>CVSS</th><th>Reason</th><th>CVEs</th></tr></thead>
           <tbody>{port_rows}</tbody>
@@ -948,8 +1076,8 @@ def generate_html(hosts: list, correlations: list, output_path: str, top_n: int)
     scan_profile = """
       <div class="scan-tip">
         <strong>💡 Recommended scan for maximum coverage:</strong><br>
-        <code>nmap -p- -sV -sC --script vuln,vulners -oA scan &lt;target&gt;</code><br>
-        <span>-p- (all ports) · -sV (version detection) · --script vuln,vulners (CVE data) · -oA (all formats)</span>
+        <code>nmap -p- -sV -sC --script vuln,vulners,ftp-anon,smb-security-mode -oA scan &lt;target&gt;</code><br>
+        <span>-p- (all ports) · -sV (version detection) · --script vuln,vulners (CVE data) · ftp-anon / smb-security-mode (misconfig checks) · -oA (all formats)</span>
       </div>"""
 
     html = f"""<!DOCTYPE html>
@@ -957,14 +1085,24 @@ def generate_html(hosts: list, correlations: list, output_path: str, top_n: int)
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>nmap_triage v2 — Vulnerability Report</title>
+<title>nmap_triage — Vulnerability Report</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#080b10;color:#b8c4d8;font-family:'Space Grotesk',sans-serif;font-size:14px;padding:2rem;line-height:1.5}}
 h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter-spacing:-1px}}
-.subtitle{{color:#4a5878;font-family:'JetBrains Mono',monospace;font-size:0.78rem;margin-bottom:2rem}}
+.subtitle{{color:#4a5878;font-family:'JetBrains Mono',monospace;font-size:0.78rem;margin-bottom:1.25rem}}
 .mono{{font-family:'JetBrains Mono',monospace}}
+
+/* Search bar */
+.search-bar{{margin-bottom:1.5rem}}
+.search-bar input{{
+  width:100%;max-width:420px;padding:0.6rem 0.9rem;
+  background:#0e1320;border:1px solid #1a2035;border-radius:8px;
+  color:#e8ecf5;font-family:'JetBrains Mono',monospace;font-size:0.85rem;
+}}
+.search-bar input::placeholder{{color:#3a4a6a}}
+.search-bar input:focus{{outline:none;border-color:#40c4ff}}
 
 /* Top stats */
 .top-stats{{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:2rem}}
@@ -976,6 +1114,7 @@ h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter
 .badge{{padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:700;font-family:'JetBrains Mono',monospace;letter-spacing:0.3px}}
 .stat-pill{{background:#1a2035;color:#8899bb;padding:2px 8px;border-radius:4px;font-size:0.72rem;margin-left:4px}}
 .stat-pill.expl{{background:#2a1020;color:#ff4d4d}}
+.stat-pill.misc{{background:#2a2010;color:#ffaa00}}
 .conf-warn{{color:#ffaa00;cursor:help;font-size:0.8rem}}
 
 /* Host cards */
@@ -986,6 +1125,11 @@ h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter
 .score{{font-size:0.72rem;color:#3a4a6a;font-family:'JetBrains Mono',monospace}}
 .port-count{{font-size:0.72rem;color:#3a4a6a}}
 .os-row{{padding:0.35rem 1.5rem;font-size:0.75rem;color:#3a4a6a;border-bottom:1px solid #1a2035;background:#0a0d16}}
+
+/* Misconfig section */
+.misconfig-section{{padding:0.8rem 1.5rem;background:#1a1408;border-bottom:1px solid #2a2010}}
+.misconfig-row{{font-size:0.8rem;color:#e0c080;padding:0.25rem 0}}
+.misconfig-row .reason{{color:#8a7050}}
 
 /* Port table */
 .port-table{{width:100%;border-collapse:collapse}}
@@ -998,7 +1142,6 @@ h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter
 .script-row td{{background:#08100a;padding:0.3rem 1rem 0.5rem 3rem}}
 .script-out{{font-size:0.73rem;color:#44aa66;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;word-break:break-all}}
 .script-id{{color:#40c4ff;margin-right:0.5rem;font-weight:600}}
-
 /* CVSS bar */
 .cvss-bar{{display:flex;align-items:center;gap:0.4rem;min-width:80px}}
 .cvss-fill{{height:6px;border-radius:3px;flex-shrink:0}}
@@ -1026,11 +1169,17 @@ h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter
 .scan-tip{{background:#0a1008;border:1px solid #1a3020;border-radius:8px;padding:1rem 1.5rem;margin-top:2rem;font-size:0.78rem;color:#4a7060}}
 .scan-tip code{{font-family:'JetBrains Mono',monospace;color:#44cc88;display:block;margin:0.4rem 0}}
 .scan-tip strong{{color:#44cc88}}
+
+.no-results{{display:none;color:#3a4a6a;font-family:'JetBrains Mono',monospace;font-size:0.85rem;padding:2rem;text-align:center}}
 </style>
 </head>
 <body>
-<h1>◈ nmap_triage v2</h1>
+<h1>◈ nmap_triage</h1>
 <div class="subtitle">Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ·  {len(hosts)} hosts  ·  top {len(sorted_hosts)} shown</div>
+
+<div class="search-bar">
+  <input type="text" id="searchBox" placeholder="Search IP, hostname, port, or service..." onkeyup="filterHosts()">
+</div>
 
 <div class="top-stats">
   <div class="stat-box"><div class="stat-val" style="color:{RISK_CSS['CRITICAL']}">{counts['CRITICAL']}</div><div class="stat-lbl">Critical</div></div>
@@ -1039,11 +1188,31 @@ h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter
   <div class="stat-box"><div class="stat-val" style="color:{RISK_CSS['LOW']}">{counts['LOW']}</div><div class="stat-lbl">Low</div></div>
   <div class="stat-box"><div class="stat-val" style="color:#cc77ff">{total_cves}</div><div class="stat-lbl">Total CVEs</div></div>
   <div class="stat-box"><div class="stat-val" style="color:{RISK_CSS['CRITICAL']}">{total_exploitable}</div><div class="stat-lbl">Exploitable</div></div>
+  <div class="stat-box"><div class="stat-val" style="color:#ffaa00">{total_misconfigs}</div><div class="stat-lbl">Misconfigs</div></div>
 </div>
 
+<div id="hostList">
 {host_cards}
+</div>
+<div class="no-results" id="noResults">No hosts match your search.</div>
+
 {corr_html}
 {scan_profile}
+
+<script>
+function filterHosts() {{
+  const q = document.getElementById('searchBox').value.toLowerCase().trim();
+  const cards = document.querySelectorAll('.host-card');
+  let visible = 0;
+  cards.forEach(card => {{
+    const text = (card.getAttribute('data-searchtext') || '').toLowerCase();
+    const match = q === '' || text.includes(q);
+    card.style.display = match ? '' : 'none';
+    if (match) visible++;
+  }});
+  document.getElementById('noResults').style.display = visible === 0 ? 'block' : 'none';
+}}
+</script>
 </body>
 </html>"""
 
@@ -1052,13 +1221,13 @@ h1{{font-family:'JetBrains Mono',monospace;font-size:1.5rem;color:#e8ecf5;letter
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DEMO XML (rich — includes NSE script output with CVEs)
+# DEMO XML (rich — includes NSE script output with CVEs and misconfigs)
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEMO_XML = """<?xml version="1.0"?>
 <nmaprun>
 
-  <!-- Windows server: SMB + RDP + Apache vuln + SSH -->
+  <!-- Windows server: SMB + RDP + Apache vuln + SSH + SMB signing disabled -->
   <host><status state="up"/>
     <address addr="192.168.1.10" addrtype="ipv4"/>
     <address addr="AA:BB:CC:11:22:33" addrtype="mac"/>
@@ -1102,7 +1271,7 @@ DEMO_XML = """<?xml version="1.0"?>
     </hostscript>
   </host>
 
-  <!-- Linux data node: Redis + MongoDB + ES + Docker -->
+  <!-- Linux data node: Redis + MongoDB + ES + Docker, all unauthenticated -->
   <host><status state="up"/>
     <address addr="192.168.1.25" addrtype="ipv4"/>
     <os><osmatch name="Linux 4.15" accuracy="87"/></os>
@@ -1136,7 +1305,7 @@ DEMO_XML = """<?xml version="1.0"?>
     </ports>
   </host>
 
-  <!-- Legacy box: vsftpd backdoor + Telnet + rexec -->
+  <!-- Legacy box: vsftpd backdoor + Telnet + rexec + anonymous FTP -->
   <host><status state="up"/>
     <address addr="10.0.0.5" addrtype="ipv4"/>
     <hostnames><hostname name="legacy-ftp.corp" type="PTR"/></hostnames>
@@ -1145,6 +1314,7 @@ DEMO_XML = """<?xml version="1.0"?>
       <port protocol="tcp" portid="21">
         <state state="open"/>
         <service name="ftp" product="vsftpd" version="2.3.4" conf="10"/>
+        <script id="ftp-anon" output="Anonymous FTP login allowed (FTP code 230)"/>
         <script id="ftp-vsftpd-backdoor" output="BACKDOOR FOUND - State: VULNERABLE&#xa;Payload sent: 0x3a0x29&#xa;Shell: Connected"/>
         <script id="vulners" output="cpe:/a:vsftpd_project:vsftpd:2.3.4">
           <table key="CVE-2011-2523"><elem key="id">CVE-2011-2523</elem><elem key="cvss">10.0</elem><elem key="type">remote exploit</elem></table>
@@ -1204,7 +1374,7 @@ DEMO_XML = """<?xml version="1.0"?>
 
 def main():
     parser = argparse.ArgumentParser(
-        description="nmap_triage v2 — elite nmap XML parser and vulnerability ranker",
+        description="nmap_triage — elite nmap XML parser and vulnerability ranker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Recommended scan:
@@ -1227,6 +1397,7 @@ Examples:
     parser.add_argument("--only-exploitable", action="store_true",                 help="Show only hosts with exploitable CVEs")
     parser.add_argument("--min-cvss",         type=float, default=0, metavar="N",  help="Filter to hosts with CVSS >= N")
     parser.add_argument("--demo",             action="store_true",                 help="Run with built-in rich demo data")
+    parser.add_argument("--merge",            metavar="FILE",                      help="Merge in a second Nmap XML scan of the same network (e.g. a deeper -p- -sV follow-up)")
     args = parser.parse_args()
 
     # Load data
@@ -1249,6 +1420,14 @@ Examples:
     if not hosts:
         print("No live hosts found in scan.")
         sys.exit(0)
+
+    if args.merge:
+        if not Path(args.merge).exists():
+            print(f"Error: merge file not found — {args.merge}", file=sys.stderr)
+            sys.exit(1)
+        second_hosts = parse_nmap_xml(args.merge)
+        hosts = merge_hosts(hosts, second_hosts)
+        print(f"\n  {DIM}[merged {len(second_hosts)} hosts from {args.merge}]{RESET}")
 
     # Apply filters
     filtered = hosts
